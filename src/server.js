@@ -101,8 +101,7 @@ app.post('/api/generate', verifyAuth, async (req, res, next) => {
   try {
     const prompt = cleanText(req.body && req.body.prompt, MAX_PROMPT_SIZE, 'prompt');
     if (!prompt) throw new HttpError(400, 'prompt is required');
-          },
-          required: ['html', 'css', 'js', 'message']    const existingFiles = req.body && req.body.existingFiles ? cleanFiles(req.body.existingFiles, false) : null;
+    const existingFiles = req.body && req.body.existingFiles ? cleanFiles(req.body.existingFiles, false) : null;
     if (!process.env.GEMINI_API_KEY) throw new HttpError(503, 'Gemini API is not configured');
     const ai = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
     const model = ai.getGenerativeModel({
@@ -116,7 +115,8 @@ app.post('/api/generate', verifyAuth, async (req, res, next) => {
             css: { type: 'STRING' },
             js: { type: 'STRING' },
             message: { type: 'STRING' }
-
+          },
+          required: ['html', 'css', 'js', 'message']
         }
       }
     });
