@@ -105,7 +105,7 @@ app.post('/api/generate', verifyAuth, async (req, res, next) => {
     if (!process.env.GEMINI_API_KEY) throw new HttpError(503, 'Gemini API is not configured');
     const ai = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
     const model = ai.getGenerativeModel({
-      model: process.env.GEMINI_MODEL || 'gemini-2.0-flash',
+      model: process.env.GEMINI_MODEL || 'gemini-3.6-flash',
       generationConfig: {
         responseMimeType: 'application/json',
         responseSchema: {
