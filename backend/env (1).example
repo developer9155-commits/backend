@@ -1,0 +1,5 @@
+GEMINI_API_KEY=AQ.Ab8RN6L5nOY4klkKz_1oGHg5PK0cbpZnqBwIfVvQAXxX-nRw0Q
+APP_SECRET=rmjihanurbsedsw
+ALLOWED_ORIGIN=https://nxora-builder.vercel.app
+GEMINI_MODEL=gemini-3.1-flash-lite
+PORT=3000
