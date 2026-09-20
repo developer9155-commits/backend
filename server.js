@@ -14,6 +14,7 @@
  */
 
 require('dotenv').config();
+console.log('ENV CHECK — GEMINI_API_KEY set:', !!process.env.GEMINI_API_KEY, '| length:', (process.env.GEMINI_API_KEY || '').length);
 const express = require('express');
 
 const DEFAULT_MODEL = 'gemini-3.1-flash-lite';
