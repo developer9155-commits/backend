@@ -12,10 +12,10 @@ services:
     startCommand: npm start
     envVars:
       - key: GEMINI_API_KEY
-        sync: false
+        value: AQ.Ab8RN6L5nOY4klkKz_1oGHg5PK0cbpZnqBwIfVvQAXxX-nRw0Q
       - key: APP_SECRET
-        sync: false
+        value: rmjihanurbsedsw 
       - key: ALLOWED_ORIGIN
-        sync: false
+        value: https://nxora-builder.vercel.app
       - key: GEMINI_MODEL
         value: gemini-3.1-flash-lite
