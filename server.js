@@ -13,6 +13,7 @@
  * Deployed on Render or Railway per the README in this folder.
  */
 
+require('dotenv').config();
 const express = require('express');
 
 const DEFAULT_MODEL = 'gemini-3.1-flash-lite';
