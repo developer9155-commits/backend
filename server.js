@@ -10,6 +10,14 @@ const PORT = Number(process.env.PORT || 10000);
 const MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
 const MAX_BODY = process.env.MAX_BODY_BYTES || '250kb';
 
+const MAX_OUTPUT_TOKENS = Number(
+  process.env.MAX_OUTPUT_TOKENS || 32000
+);
+
+const GENERATION_RETRIES = Number(
+  process.env.GENERATION_RETRIES || 2
+);
+
 /* -------------------------------------------------------
    CORS
 ------------------------------------------------------- */
@@ -30,8 +38,6 @@ const allowedOrigins = parseOrigins(
 app.use(
   cors({
     origin(origin, callback) {
-      // Allow requests without an Origin header
-      // and allow all origins when configured as *
       if (
         !origin ||
         allowedOrigins === '*' ||
@@ -40,7 +46,9 @@ app.use(
         return callback(null, true);
       }
 
-      return callback(new Error('Origin not allowed by CORS'));
+      return callback(
+        new Error('Origin not allowed by CORS')
+      );
     },
 
     methods: ['GET', 'POST', 'OPTIONS'],
@@ -67,15 +75,9 @@ app.use(
 ------------------------------------------------------- */
 
 function initFirebaseAdmin() {
-  // Prevent duplicate initialization
   if (admin.apps.length) {
     return admin.app();
   }
-
-  /*
-    Option 1:
-    FIREBASE_SERVICE_ACCOUNT_JSON
-  */
 
   const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
 
@@ -92,11 +94,6 @@ function initFirebaseAdmin() {
       );
     }
   }
-
-  /*
-    Option 2:
-    Separate Firebase credentials
-  */
 
   const projectId = process.env.FIREBASE_PROJECT_ID;
   const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
@@ -118,10 +115,6 @@ function initFirebaseAdmin() {
     })
   });
 }
-
-/*
-  Initialize Firebase once when server starts.
-*/
 
 let firebaseInitError = null;
 
@@ -150,18 +143,6 @@ const ai = process.env.GEMINI_API_KEY
    RATE LIMITER
 ------------------------------------------------------- */
 
-/*
-  IMPORTANT:
-
-  express-rate-limit requires ipKeyGenerator()
-  when using req.ip because IPv6 addresses need
-  to be normalized correctly.
-
-  Logged-in users are limited by Firebase UID.
-
-  Unauthenticated requests are limited by IP.
-*/
-
 const limiter = rateLimit({
   windowMs: 60 * 1000,
 
@@ -174,12 +155,10 @@ const limiter = rateLimit({
   legacyHeaders: false,
 
   keyGenerator: req => {
-    // Firebase user
     if (req.user?.uid) {
       return `user:${req.user.uid}`;
     }
 
-    // IPv4 / IPv6-safe IP key
     return `ip:${ipKeyGenerator(req.ip)}`;
   },
 
@@ -196,13 +175,8 @@ const limiter = rateLimit({
 ------------------------------------------------------- */
 
 async function requireFirebaseUser(req, res, next) {
-  const authHeader = req.get('Authorization') || '';
-
-  /*
-    Expected:
-
-    Authorization: Bearer FIREBASE_ID_TOKEN
-  */
+  const authHeader =
+    req.get('Authorization') || '';
 
   if (!authHeader.startsWith('Bearer ')) {
     return res.status(401).json({
@@ -257,85 +231,155 @@ app.get('/health', (req, res) => {
     service: 'nexora-ai-backend',
     model: MODEL,
     geminiConfigured: Boolean(ai),
-    firebaseConfigured: !firebaseInitError
+    firebaseConfigured: !firebaseInitError,
+    maxOutputTokens: MAX_OUTPUT_TOKENS,
+    generationRetries: GENERATION_RETRIES
   });
 });
 
 /* -------------------------------------------------------
-   AI GENERATION
+   CLEAN GEMINI RESPONSE
 ------------------------------------------------------- */
 
-app.post(
-  '/generate',
-  requireFirebaseUser,
-  limiter,
-  async (req, res) => {
+function cleanGeminiText(text) {
+  if (typeof text !== 'string') {
+    return '';
+  }
+
+  let cleaned = text.trim();
+
+  /*
+    Remove accidental markdown fences.
+  */
+
+  if (cleaned.startsWith('```json')) {
+    cleaned = cleaned.slice(7).trim();
+  } else if (cleaned.startsWith('```')) {
+    cleaned = cleaned.slice(3).trim();
+  }
+
+  if (cleaned.endsWith('```')) {
+    cleaned = cleaned.slice(0, -3).trim();
+  }
+
+  return cleaned;
+}
+
+/* -------------------------------------------------------
+   GEMINI JSON PARSER
+------------------------------------------------------- */
+
+function parseGeminiJson(text) {
+  const cleaned = cleanGeminiText(text);
+
+  if (!cleaned) {
+    throw new Error('Gemini returned an empty response.');
+  }
+
+  try {
+    return JSON.parse(cleaned);
+  } catch (error) {
     /*
-      Make sure Gemini is configured.
+      Do not try to "repair" HTML/CSS/JS JSON manually.
+      A truncated JSON string cannot be safely reconstructed
+      because quotes, backslashes and newlines may be missing.
     */
 
-    if (!ai) {
-      return res.status(500).json({
-        error:
-          'Gemini API is not configured on the backend.'
-      });
-    }
+    const positionMatch =
+      error?.message?.match(/position (\d+)/i);
 
-    /*
-      Validate request body.
-    */
+    const position = positionMatch
+      ? Number(positionMatch[1])
+      : null;
 
-    const system =
-      typeof req.body?.system === 'string'
-        ? req.body.system.trim()
-        : '';
+    const start =
+      position !== null
+        ? Math.max(0, position - 500)
+        : Math.max(0, cleaned.length - 1500);
 
-    const prompt =
-      typeof req.body?.prompt === 'string'
-        ? req.body.prompt.trim()
-        : '';
+    const end =
+      position !== null
+        ? Math.min(cleaned.length, position + 500)
+        : cleaned.length;
 
-    if (!system || !prompt) {
-      return res.status(400).json({
-        error:
-          'Both system instructions and prompt are required.'
-      });
-    }
+    const aroundError =
+      cleaned.slice(start, end);
 
-    /*
-      Prevent extremely large prompts.
-    */
+    console.error(
+      'Gemini JSON parse error:',
+      error?.message
+    );
 
-    if (prompt.length > 120000) {
-      return res.status(413).json({
-        error:
-          'The request is too large. Please shorten the project or files.'
-      });
-    }
+    console.error(
+      'Gemini response length:',
+      cleaned.length
+    );
 
-    /*
-      Gemini instruction.
-    */
+    console.error(
+      'Gemini response near error:',
+      aroundError
+    );
 
-    const instruction = `
+    throw error;
+  }
+}
+
+/* -------------------------------------------------------
+   GENERATE WEBSITE
+------------------------------------------------------- */
+
+async function generateWebsite(system, prompt) {
+  const instruction = `
 ${system}
 
 IMPORTANT OUTPUT RULES:
 
-- Return only the requested JSON object.
-- Do not wrap the JSON in markdown fences.
-- Keep html, css and js complete and self-contained as requested.
-- Never include API keys.
-- Never include Firebase service-account credentials.
-- Never include server secrets.
-- Never include backend environment variables in generated code.
+1. Return ONLY one valid JSON object.
+2. Do NOT use markdown code fences.
+3. The JSON must contain exactly these fields:
+   - html
+   - css
+   - js
+   - message
+4. html, css, js and message must all be JSON strings.
+5. Properly escape all quotes, backslashes and newlines required by JSON.
+6. Make sure the JSON object is completely finished before stopping.
+7. NEVER stop in the middle of an HTML, CSS or JavaScript string.
+8. Do not include API keys.
+9. Do not include Firebase service-account credentials.
+10. Do not include server secrets.
+11. Do not include backend environment variables.
+12. Do not include base64 encoded images.
+13. Do not generate unnecessarily huge code.
+14. Keep the website professional and complete.
+15. Prefer external image URLs, CSS gradients, or lightweight placeholders instead of embedding large image data.
+16. Avoid unnecessary comments and repeated code.
+17. Make the generated HTML, CSS and JavaScript concise while preserving the requested design and functionality.
+
+CRITICAL:
+Before returning the response, verify that:
+- all JSON strings are closed
+- all JSON brackets are closed
+- the final character is the closing } of the JSON object
+- html is complete
+- css is complete
+- js is complete
+
+USER REQUEST:
 
 ${prompt}
 `;
 
+  let lastError = null;
+
+  for (
+    let attempt = 1;
+    attempt <= GENERATION_RETRIES + 1;
+    attempt++
+  ) {
     try {
       console.log(
-        `Generation request from Firebase user: ${req.user?.uid || 'unknown'}`
+        `Gemini generation attempt ${attempt}/${GENERATION_RETRIES + 1}`
       );
 
       const response =
@@ -345,14 +389,11 @@ ${prompt}
           contents: instruction,
 
           config: {
-            temperature: 0.35,
+            temperature: 0.25,
 
-            maxOutputTokens: Number(
-              process.env.MAX_OUTPUT_TOKENS || 24000
-            ),
+            maxOutputTokens: MAX_OUTPUT_TOKENS,
 
-            responseMimeType:
-              'application/json',
+            responseMimeType: 'application/json',
 
             responseSchema: {
               type: 'object',
@@ -385,50 +426,54 @@ ${prompt}
           }
         });
 
-      /*
-        Gemini response
-      */
-
       const text =
         typeof response?.text === 'string'
           ? response.text
           : '';
 
-      if (!text) {
-        console.error(
+      const finishReason =
+        response?.candidates?.[0]?.finishReason ||
+        response?.candidates?.[0]?.finish_reason ||
+        'unknown';
+
+      console.log(
+        `Gemini response length: ${text.length}`
+      );
+
+      console.log(
+        `Gemini finish reason: ${finishReason}`
+      );
+
+      if (!text.trim()) {
+        throw new Error(
           'Gemini returned an empty response.'
         );
-
-        return res.status(502).json({
-          error:
-            'Gemini returned an empty response. Please try again.'
-        });
       }
 
       /*
-        Parse JSON returned by Gemini.
+        If the model stopped because it reached the
+        output limit, retry instead of immediately
+        sending an invalid JSON response to frontend.
       */
 
-      let result;
+      const normalizedFinishReason =
+        String(finishReason).toUpperCase();
 
-      try {
-        result = JSON.parse(text);
-      } catch (parseError) {
-        console.error(
-          'Gemini JSON parse error:',
-          parseError?.message
+      if (
+        normalizedFinishReason.includes('MAX_TOKENS') ||
+        normalizedFinishReason.includes('LENGTH')
+      ) {
+        console.warn(
+          'Gemini response appears to have been truncated.'
         );
 
-        console.error(
-          'Gemini raw response:',
-          text.slice(0, 2000)
+        throw new Error(
+          'Gemini response was truncated because it reached the output limit.'
         );
-
-        return res.status(502).json({
-          error:
-            'Gemini returned invalid JSON. Please try again.'
-        });
       }
+
+      const result =
+        parseGeminiJson(text);
 
       /*
         Validate generated website.
@@ -439,14 +484,13 @@ ${prompt}
         typeof result.html !== 'string' ||
         !result.html.trim()
       ) {
-        return res.status(502).json({
-          error:
-            'Gemini returned an incomplete website. Please try again.'
-        });
+        throw new Error(
+          'Gemini returned an incomplete website.'
+        );
       }
 
       /*
-        Make sure optional fields always exist.
+        Make optional fields safe.
       */
 
       if (typeof result.css !== 'string') {
@@ -461,8 +505,127 @@ ${prompt}
         result.message = '';
       }
 
+      /*
+        Basic sanity checks.
+      */
+
+      if (result.html.length < 50) {
+        throw new Error(
+          'Gemini returned HTML that is too short.'
+        );
+      }
+
       console.log(
-        `Generation successful for user: ${req.user?.uid || 'unknown'}`
+        `Generation successful on attempt ${attempt}`
+      );
+
+      return result;
+
+    } catch (error) {
+      lastError = error;
+
+      console.error(
+        `Gemini attempt ${attempt} failed:`,
+        error?.message || error
+      );
+
+      /*
+        Retry only for generation/JSON problems.
+
+        API authentication, quota and invalid-request
+        errors should not be unnecessarily retried.
+      */
+
+      const status =
+        Number(error?.status) || 0;
+
+      if (
+        status === 400 ||
+        status === 401 ||
+        status === 403 ||
+        status === 429
+      ) {
+        throw error;
+      }
+
+      if (
+        attempt <= GENERATION_RETRIES
+      ) {
+        console.log(
+          'Retrying Gemini generation...'
+        );
+
+        await new Promise(resolve =>
+          setTimeout(resolve, 800)
+        );
+      }
+    }
+  }
+
+  throw lastError ||
+    new Error(
+      'Gemini failed to generate a complete website.'
+    );
+}
+
+/* -------------------------------------------------------
+   AI GENERATION ROUTE
+------------------------------------------------------- */
+
+app.post(
+  '/generate',
+  requireFirebaseUser,
+  limiter,
+  async (req, res) => {
+
+    if (!ai) {
+      return res.status(500).json({
+        error:
+          'Gemini API is not configured on the backend.'
+      });
+    }
+
+    const system =
+      typeof req.body?.system === 'string'
+        ? req.body.system.trim()
+        : '';
+
+    const prompt =
+      typeof req.body?.prompt === 'string'
+        ? req.body.prompt.trim()
+        : '';
+
+    if (!system || !prompt) {
+      return res.status(400).json({
+        error:
+          'Both system instructions and prompt are required.'
+      });
+    }
+
+    if (prompt.length > 120000) {
+      return res.status(413).json({
+        error:
+          'The request is too large. Please shorten the project or files.'
+      });
+    }
+
+    try {
+      console.log(
+        `Generation request from Firebase user: ${
+          req.user?.uid || 'unknown'
+        }`
+      );
+
+      const result =
+        await generateWebsite(
+          system,
+          prompt
+        );
+
+      console.log(
+        `Generation successful for user: ${
+          req.user?.uid || 'unknown'
+        }`
       );
 
       return res.json({
@@ -470,10 +633,6 @@ ${prompt}
       });
 
     } catch (err) {
-      /*
-        IMPORTANT:
-        Log the actual Gemini error in Render logs.
-      */
 
       console.error(
         'Gemini generation error:',
@@ -490,12 +649,12 @@ ${prompt}
         err?.code || 'unknown'
       );
 
+      const status =
+        Number(err?.status) || 500;
+
       /*
         Gemini rate limit
       */
-
-      const status =
-        Number(err?.status) || 500;
 
       if (status === 429) {
         return res.status(429).json({
@@ -530,7 +689,31 @@ ${prompt}
       }
 
       /*
-        Temporary Gemini/server problem
+        Truncated/incomplete JSON.
+      */
+
+      if (
+        err?.message?.includes(
+          'truncated'
+        ) ||
+        err?.message?.includes(
+          'Unterminated'
+        ) ||
+        err?.message?.includes(
+          'Unexpected end'
+        ) ||
+        err?.message?.includes(
+          'incomplete website'
+        )
+      ) {
+        return res.status(502).json({
+          error:
+            'The AI generated an incomplete website after multiple attempts. Please try generating again or use a slightly shorter prompt.'
+        });
+      }
+
+      /*
+        General Gemini/server problem
       */
 
       return res.status(502).json({
@@ -546,19 +729,12 @@ ${prompt}
 ------------------------------------------------------- */
 
 app.use((err, req, res, next) => {
-  /*
-    Request too large
-  */
 
   if (err?.type === 'entity.too.large') {
     return res.status(413).json({
       error: 'Request is too large.'
     });
   }
-
-  /*
-    CORS
-  */
 
   if (
     err?.message ===
@@ -587,6 +763,7 @@ app.listen(
   PORT,
   '0.0.0.0',
   () => {
+
     console.log(
       `Nexora AI backend listening on 0.0.0.0:${PORT}`
     );
@@ -596,7 +773,17 @@ app.listen(
     );
 
     console.log(
-      `Gemini API: ${ai ? 'configured' : 'NOT CONFIGURED'}`
+      `Gemini max output tokens: ${MAX_OUTPUT_TOKENS}`
+    );
+
+    console.log(
+      `Gemini generation retries: ${GENERATION_RETRIES}`
+    );
+
+    console.log(
+      `Gemini API: ${
+        ai ? 'configured' : 'NOT CONFIGURED'
+      }`
     );
 
     console.log(
