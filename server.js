@@ -7,7 +7,7 @@ import { GoogleGenAI } from '@google/genai';
 const app = express();
 
 const PORT = Number(process.env.PORT || 10000);
-const MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite';
+const MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
 const MAX_BODY = process.env.MAX_BODY_BYTES || '250kb';
 
 /* -------------------------------------------------------
